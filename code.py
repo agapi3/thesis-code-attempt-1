@@ -1,0 +1,458 @@
+from langchain import LLMChain, PromptTemplate
+from langchain_community.llms import Ollama
+import re, ast, os, json, numpy as np
+from difflib import SequenceMatcher
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sentence_transformers import SentenceTransformer
+import torch
+
+# -----------------------------
+# 1. Ορισμός LLM
+# -----------------------------
+llm = Ollama(model="llama2", temperature=0)
+
+
+# -----------------------------
+# 2. Prompts
+# -----------------------------
+
+#influential_chain
+influential_prompt = PromptTemplate.from_template(r"""
+You are a careful medical assistant.
+
+Task:
+- Identify 2–3 influential medical words or short phrases from the QUESTION only.
+- Focus only on descriptive symptoms, conditions, medications, or affected body parts.
+- Return strictly a valid Python list of strings (e.g. ["fever","cough"]).
+
+QUESTION:
+{input}
+""")
+influential_chain = LLMChain(llm=llm, prompt=influential_prompt, output_key="influential_words")
+
+
+
+
+
+#synonym_chain
+synonym_prompt = PromptTemplate.from_template(r"""
+You are given ONE influential medical term.
+
+Task:
+- Generate ONE medically valid synonym (common medical alternative term).
+- If no valid synonym exists, return "no change".
+
+Return ONLY valid JSON:
+{{
+  "word": "{word}",
+  "synonym": "..."
+}}
+""")
+synonym_chain = LLMChain(llm=llm, prompt=synonym_prompt, output_key="synonym")
+
+
+
+
+
+
+
+
+#antonym_chain 
+antonym_prompt = PromptTemplate.from_template(r"""
+You are given ONE influential medical term.
+
+Task:
+- Generate ONE medically valid antonym or logical negation.
+- If no valid antonym exists, return "no {word}".
+
+Return ONLY valid JSON:
+{{
+  "word": "{word}",
+  "antonym": "..."
+}}
+""")
+antonym_chain = LLMChain(llm=llm, prompt=antonym_prompt, output_key="antonym")
+
+
+
+
+
+
+
+
+
+
+
+
+#counterfactual_chain
+counterfactual_prompt = PromptTemplate.from_template(r'''
+You are a careful medical assistant.
+
+Task:
+- Take the influential word/phrase "{word}".
+- Replace it once with "{replacement}" inside the QUESTION.
+- Rewrite the QUESTION with ONLY that change.
+
+Important rules:
+- If "{replacement}" is a **synonym**, keep the medical meaning and the Final Advice almost identical to the original advice.
+- If "{replacement}" is an **antonym** (e.g. logical negation), then adjust the reasoning and Final Advice accordingly.
+- Do NOT introduce unrelated changes.
+- Always preserve medical accuracy and consistency.
+
+Format:
+--- Counterfactual for "{word}" (Replacement: {replacement}) ---
+Modified Input:
+"<full modified input>"
+
+Reasoning:
+Step 1: Identify the role of "{word}" in the original input.
+Step 2: Insert "{replacement}" into the question.
+Step 3: Compare medical meaning between original and modified.
+Step 4: Decide whether advice should remain stable (synonym) or change (antonym).
+Step 5: Provide reasoning for this choice.
+Step 6: Ensure clinical accuracy and consistency.
+
+Final Advice:
+"<concise medical advice>"
+
+Original Question: {input}
+''')
+
+counterfactual_chain = LLMChain(llm=llm, prompt=counterfactual_prompt, output_key="counterfactual")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# -----------------------------
+# 3. Helper Functions
+# -----------------------------
+def extract_influential_words(raw_output):
+    try:
+        match = re.search(r"\[.*?\]", str(raw_output), re.DOTALL)
+        if match:
+            return ast.literal_eval(match.group())
+    except:
+        pass
+    return []
+
+def safe_parse_json(raw, key, word):
+    try:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            data = json.loads(match.group())
+            if key in data and data[key] and str(data[key]).strip():
+                return str(data[key]).strip()
+    except:
+        pass
+    return f"no {word}" if key == "antonym" else "no change"
+
+def cosine_similarity(a: str, b: str) -> float:
+    vect = TfidfVectorizer().fit([a, b])
+    vecs = vect.transform([a, b])
+    return float((vecs[0] @ vecs[1].T).toarray()[0][0])
+
+def sequence_similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+def replace_word_in_text(text, word, replacement):
+    pattern = r'\b{}\b'.format(re.escape(word))
+    return re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
+def enforce_format(text, word, replacement, sample):
+    if not text or "--- Counterfactual" not in text:
+        return f"""
+--- Counterfactual for "{word}" (Replacement: {replacement}) ---
+Modified Input:
+"<{sample['input']} (with replacement)>"
+
+Reasoning:
+Step 1: (auto-generated)
+Step 2: (auto-generated)
+Step 3: (auto-generated)
+Step 4: (auto-generated)
+Step 5: (auto-generated)
+Step 6: (auto-generated)
+
+Final Advice:
+"(fallback advice)"
+
+Original Question: {sample['input']}
+Original Advice: {sample['output']}
+"""
+    return text.strip()
+
+def get_replacements(word, cache={}):
+    if word in cache:
+        return cache[word]
+    syn_raw = synonym_chain.invoke({"word": word})
+    ant_raw = antonym_chain.invoke({"word": word})
+    syn = safe_parse_json(syn_raw.get("synonym", ""), "synonym", word)
+    ant = safe_parse_json(ant_raw.get("antonym", ""), "antonym", word)
+    replacements = []
+    if syn.lower() != "no change":
+        replacements.append(syn)
+    if ant.lower() not in [f"no {word.lower()}", "nochange"]:
+        replacements.append(ant)
+    if not replacements:
+        replacements.append("no change")
+    cache[word] = replacements
+    return replacements
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# -----------------------------
+# 4. Pipeline
+# -----------------------------
+def process_sample(sample, max_retries=3, bert_threshold=0.75):
+    infl_raw = influential_chain.invoke({"input": sample["input"]})
+    infl_words = extract_influential_words(infl_raw.get("influential_words", []))
+    infl_words = sorted(infl_words, key=lambda x: -len(x.split()))
+
+    results = {"influential_words": infl_words, "counterfactuals": []}
+
+    for w in infl_words:
+        for rep in get_replacements(w):
+            modified_input = replace_word_in_text(sample["input"], w, rep)
+
+            
+            #retry loop for synonyms 
+           
+            retries = 0
+            cf_text, final_advice, cf_type = None, "n/a", "syn"
+
+            if rep.lower() == "no change":
+                cf_type = "syn"
+            elif rep.lower().startswith("no "):
+                cf_type = "ant"
+            else:
+                cf_type = "syn"
+
+            while retries < max_retries:
+                cf_result = counterfactual_chain.invoke({
+                    "input": modified_input,
+                    "output": sample["output"],
+                    "word": w,
+                    "replacement": rep
+                })
+                cf_text = cf_result.get("counterfactual", "")
+                cf_text = enforce_format(cf_text, w, rep, sample)
+
+                # extract final advice
+                m = re.search(r"Final Advice:\s*\"(.*?)\"", cf_text, re.DOTALL)
+                if m:
+                    final_advice = m.group(1).strip()
+
+                # if it's synonym -> BERT check
+                if cf_type == "syn":
+                    sim = cosine_bert(final_advice, sample["output"])
+                    if sim >= bert_threshold:
+                        break  
+                else:
+                    break  
+
+                retries += 1
+
+            # Έγκυρο flag
+            valid = "--- Counterfactual" in cf_text
+
+            results["counterfactuals"].append({
+                "text": cf_text,
+                "modified_input": modified_input,
+                "final_advice": final_advice,
+                "valid": valid,
+                "type": cf_type
+            })
+
+    return results
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# -----------------------------
+# 5. Evaluation
+# -----------------------------
+def _triplet_scores(a: str, b: str):
+    return (cosine_tfidf(a, b), sequence_similarity(a, b), cosine_bert(a, b))
+
+
+# Cosine similarity with TF-IDF
+def cosine_tfidf(a: str, b: str) -> float:
+    vect = TfidfVectorizer().fit([a, b])
+    vecs = vect.transform([a, b])
+    return float((vecs[0] @ vecs[1].T).toarray()[0][0])
+
+
+# Cosine similarity with BERT embeddings
+bert_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+def cosine_bert(a: str, b: str) -> float:
+    emb = bert_model.encode([a, b], convert_to_tensor=True)
+    return float(torch.nn.functional.cosine_similarity(emb[0], emb[1], dim=0))
+
+
+def evaluate_dataset(samples, max_items=10, verbose=True):
+    buckets = {
+        "syn_vs_gt":   {"cosine": [], "seq": [], "bert": []},
+        "syn_vs_orig": {"cosine": [], "seq": [], "bert": []},
+        "ant_vs_orig": {"cosine": [], "seq": [], "bert": []},
+    }
+    for i, sample in enumerate(samples[:max_items], start=1):
+        res = process_sample(sample)
+        if verbose:
+            print(f"\n=== Sample {i} ===")
+            print("Input:", sample["input"])
+            print("Output:", sample["output"])
+            print("Influential Words:", res["influential_words"])
+            print("\n--- Counterfactuals ---")
+        for cf in res["counterfactuals"]:
+            if verbose:
+                print(cf["text"])
+            if not cf["valid"]:
+                continue
+            if cf["type"] == "syn":
+                c, s, b = _triplet_scores(cf["final_advice"], sample["output"])
+                buckets["syn_vs_gt"]["cosine"].append(c)
+                buckets["syn_vs_gt"]["seq"].append(s)
+                buckets["syn_vs_gt"]["bert"].append(b)
+                c2, s2, b2 = _triplet_scores(cf["modified_input"], sample["input"])
+                buckets["syn_vs_orig"]["cosine"].append(c2)
+                buckets["syn_vs_orig"]["seq"].append(s2)
+                buckets["syn_vs_orig"]["bert"].append(b2)
+            elif cf["type"] == "ant":
+                c3, s3, b3 = _triplet_scores(cf["final_advice"], sample["output"])
+                buckets["ant_vs_orig"]["cosine"].append(c3)
+                buckets["ant_vs_orig"]["seq"].append(s3)
+                buckets["ant_vs_orig"]["bert"].append(b3)
+    def mean(lst):
+        return float(np.mean(lst)) if lst else None
+    final_metrics = {}
+    for k, v in buckets.items():
+        final_metrics[f"{k}_cosine"] = mean(v["cosine"])
+        final_metrics[f"{k}_seq"]     = mean(v["seq"])
+        final_metrics[f"{k}_bert"]    = mean(v["bert"])
+    return final_metrics
+
+def pretty_print_metrics(m):
+    print("\n================ METRICS ================")
+    def fmt(x):
+        return f"{x:.4f}" if isinstance(x, (int, float)) and x is not None else "n/a"
+    print(f"syn_vs_gt    ->  TFIDF: {fmt(m.get('syn_vs_gt_cosine'))} | SEQ: {fmt(m.get('syn_vs_gt_seq'))} | BERT: {fmt(m.get('syn_vs_gt_bert'))}")
+    print(f"syn_vs_orig  ->  TFIDF: {fmt(m.get('syn_vs_orig_cosine'))} | SEQ: {fmt(m.get('syn_vs_orig_seq'))} | BERT: {fmt(m.get('syn_vs_orig_bert'))}")
+    print(f"ant_vs_orig  ->  TFIDF: {fmt(m.get('ant_vs_orig_cosine'))} | SEQ: {fmt(m.get('ant_vs_orig_seq'))} | BERT: {fmt(m.get('ant_vs_orig_bert'))}")
+    print("=========================================\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+# -----------------------------
+# 6. Interactive Session
+# -----------------------------
+followup_prompt = PromptTemplate.from_template(r"""
+You are an interactive counterfactual medical assistant.
+
+Context:
+Original Question: {input}
+Original Advice: {output}
+Influential Words: {infl_words}
+Previous Counterfactuals:
+{counterfactuals}
+
+User request:
+{user_query}
+
+Task:
+- Carefully reason about the request.
+- Return in strict format:
+
+--- Follow-up Analysis ---
+Modified Input:
+"<new input>"
+
+Reasoning:
+Step 1: ...
+Step 2: ...
+Step 3: ...
+Step 4: ...
+Step 5: ...
+Step 6: ...
+
+Final Advice:
+"<new advice>"
+""")
+followup_chain = LLMChain(llm=llm, prompt=followup_prompt, output_key="text")
+
+def interactive_session(sample, results):
+    print("\n=== Interactive Session ===")
+    while True:
+        q = input("\nUser: ")
+        if q.lower() in ["exit", "quit"]:
+            break
+        res = followup_chain.invoke({
+            "input": sample["input"],
+            "output": sample["output"],
+            "infl_words": results["influential_words"],
+            "counterfactuals": "\n".join(cf["text"] for cf in results["counterfactuals"]),
+            "user_query": q
+        })
+        print("\n" + res["text"])
+
+
+
+
+
+
+
+
+
+
+
+# -----------------------------
+# 7. Example Run
+# -----------------------------
+results_metrics = evaluate_dataset(cleaned_healthcaremagic, max_items=20)
+pretty_print_metrics(results_metrics)
+
+sample = cleaned_healthcaremagic[0]
+res = process_sample(sample)
+interactive_session(sample, res)
