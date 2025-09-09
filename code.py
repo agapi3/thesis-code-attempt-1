@@ -133,6 +133,10 @@ counterfactual_chain = LLMChain(llm=llm, prompt=counterfactual_prompt, output_ke
 
 
 
+
+
+
+
 # -----------------------------
 # 3. Helper Functions
 # -----------------------------
@@ -225,7 +229,7 @@ def get_replacements(word, cache={}):
 # -----------------------------
 # 4. Pipeline
 # -----------------------------
-def process_sample(sample, max_retries=3, bert_threshold=0.75):
+def process_sample(sample, max_retries=3):
     infl_raw = influential_chain.invoke({"input": sample["input"]})
     infl_words = extract_influential_words(infl_raw.get("influential_words", []))
     infl_words = sorted(infl_words, key=lambda x: -len(x.split()))
@@ -235,21 +239,9 @@ def process_sample(sample, max_retries=3, bert_threshold=0.75):
     for w in infl_words:
         for rep in get_replacements(w):
             modified_input = replace_word_in_text(sample["input"], w, rep)
-
-            
-            #retry loop for synonyms 
-           
+            cf_text = None
             retries = 0
-            cf_text, final_advice, cf_type = None, "n/a", "syn"
-
-            if rep.lower() == "no change":
-                cf_type = "syn"
-            elif rep.lower().startswith("no "):
-                cf_type = "ant"
-            else:
-                cf_type = "syn"
-
-            while retries < max_retries:
+            while retries < max_retries and (not cf_text or "--- Counterfactual" not in cf_text):
                 cf_result = counterfactual_chain.invoke({
                     "input": modified_input,
                     "output": sample["output"],
@@ -257,24 +249,25 @@ def process_sample(sample, max_retries=3, bert_threshold=0.75):
                     "replacement": rep
                 })
                 cf_text = cf_result.get("counterfactual", "")
-                cf_text = enforce_format(cf_text, w, rep, sample)
-
-                # extract final advice
-                m = re.search(r"Final Advice:\s*\"(.*?)\"", cf_text, re.DOTALL)
-                if m:
-                    final_advice = m.group(1).strip()
-
-                # if it's synonym -> BERT check
-                if cf_type == "syn":
-                    sim = cosine_bert(final_advice, sample["output"])
-                    if sim >= bert_threshold:
-                        break  
-                else:
-                    break  
-
                 retries += 1
 
-            # Έγκυρο flag
+            cf_text = enforce_format(cf_text, w, rep, sample)
+
+            # try to extract final advice from cf_text
+            final_advice = "n/a"
+            m = re.search(r"Final Advice:\s*\"(.*?)\"", cf_text, re.DOTALL)
+            if m:
+                final_advice = m.group(1).strip()
+
+            # define type : replacement
+            if rep.lower() == "no change":
+                cf_type = "syn"
+            elif rep.lower().startswith("no "):
+                cf_type = "ant"
+            else:
+                cf_type = "syn"  # default to synonym if it's not clear
+
+            # Valid flag
             valid = "--- Counterfactual" in cf_text
 
             results["counterfactuals"].append({
@@ -314,7 +307,7 @@ def cosine_tfidf(a: str, b: str) -> float:
     return float((vecs[0] @ vecs[1].T).toarray()[0][0])
 
 
-# Cosine similarity with BERT embeddings
+# Cosine similarity με BERT embeddings
 bert_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 def cosine_bert(a: str, b: str) -> float:
@@ -422,6 +415,10 @@ Final Advice:
 """)
 followup_chain = LLMChain(llm=llm, prompt=followup_prompt, output_key="text")
 
+
+
+
+
 def interactive_session(sample, results):
     print("\n=== Interactive Session ===")
     while True:
@@ -436,7 +433,6 @@ def interactive_session(sample, results):
             "user_query": q
         })
         print("\n" + res["text"])
-
 
 
 
