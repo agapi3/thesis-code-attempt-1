@@ -85,38 +85,52 @@ antonym_chain = LLMChain(llm=llm, prompt=antonym_prompt, output_key="antonym")
 
 
 #counterfactual_chain
-counterfactual_prompt = PromptTemplate.from_template(r'''
+counterfactual_prompt = PromptTemplate.from_template(r"""
 You are a careful medical assistant.
 
 Task:
-- Take the influential word/phrase "{word}".
-- Replace it once with "{replacement}" inside the QUESTION.
-- Rewrite the QUESTION with ONLY that change.
+- Rewrite according to strict format below.
+- Do NOT include any extra explanations outside the format.
+- Do NOT repeat the question or advice more than once.
+- Follow EXACTLY the example structure.
+- Always include detailed, step-by-step reasoning that explains the medical logic behind the Final Advice.
 
-Important rules:
-- If "{replacement}" is a **synonym**, keep the medical meaning and the Final Advice almost identical to the original advice.
-- If "{replacement}" is an **antonym** (e.g. logical negation), then adjust the reasoning and Final Advice accordingly.
-- Do NOT introduce unrelated changes.
-- Always preserve medical accuracy and consistency.
-
-Format:
---- Counterfactual for "{word}" (Replacement: {replacement}) ---
+### EXAMPLE FORMAT
+--- Counterfactual for "persistent" (Replacement: "chronic") ---
 Modified Input:
-"<full modified input>"
+"I have a chronic dry cough for the last 3 weeks. Should I be concerned?"
 
 Reasoning:
-Step 1: Identify the role of "{word}" in the original input.
-Step 2: Insert "{replacement}" into the question.
-Step 3: Compare medical meaning between original and modified.
-Step 4: Decide whether advice should remain stable (synonym) or change (antonym).
-Step 5: Provide reasoning for this choice.
-Step 6: Ensure clinical accuracy and consistency.
+Step 1: Identify key symptoms and relevant conditions.
+- "chronic dry cough" indicates a long-term airway issue.
+Step 2: Consider possible diagnoses based on symptoms.
+- Chronic cough >2 weeks → asthma, bronchitis, other chronic conditions.
+Step 3: Analyze relationships between symptoms and determine the most likely diagnosis.
+- Non-productive cough with chronic duration → suspicious for asthma variant or bronchitis.
+Step 4: Consider potential alternative diagnoses and eliminate them.
+- Acute infection less likely due to 3-week persistence without improvement.
+Step 5: Suggest next steps or treatments.
+- Pulmonary function testing, spirometry, smoking history, inhaled bronchodilator trial.
+Step 6: Explain why you chose this final advice.
+- Chronic label strengthens suspicion for long-term disease, requires workup.
 
 Final Advice:
-"<concise medical advice>"
+"Chronic dry cough lasting more than 3 weeks warrants pulmonary function testing. Please schedule a spirometry and consider an inhaled bronchodilator trial."
 
+Original Question: I have a persistent dry cough for the last 3 weeks. Should I be concerned?
+Original Advice: A persistent dry cough lasting more than two weeks could indicate an underlying condition such as asthma or even something more serious. It's advisable to consult a doctor for a proper evaluation.
+
+--- END OF EXAMPLE FORMAT ---
+
+Now apply the same format to this case:
+
+Word: {word}
+Replacement: {replacement}
 Original Question: {input}
-''')
+Original Advice: {output}
+""")
+
+
 
 counterfactual_chain = LLMChain(llm=llm, prompt=counterfactual_prompt, output_key="counterfactual")
 
