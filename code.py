@@ -5,9 +5,27 @@ from difflib import SequenceMatcher
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sentence_transformers import SentenceTransformer
 import torch
+import pickle
 
 # -----------------------------
-# 1.define LLM
+# Cache setup
+# -----------------------------
+CACHE_FILE = "stored_results.pkl"
+if os.path.exists(CACHE_FILE):
+    with open(CACHE_FILE, "rb") as f:
+        stored_results = pickle.load(f)
+    #print(f"[INFO] Loaded {len(stored_results)} cached results.")
+else:
+    stored_results = {}
+    #print("[INFO] No cache found, will compute from scratch.")
+
+
+
+
+
+
+# -----------------------------
+# 1. Define LLM
 # -----------------------------
 llm = Ollama(model="llama2", temperature=0)
 
@@ -15,10 +33,7 @@ llm = Ollama(model="llama2", temperature=0)
 # 2. Prompts
 # -----------------------------
 
-
-
-
-#influential_prompt
+# Influential Prompt
 influential_prompt = PromptTemplate.from_template(r"""
 You are a careful medical assistant.
 
@@ -35,7 +50,7 @@ influential_chain = LLMChain(llm=llm, prompt=influential_prompt, output_key="inf
 
 
 
-#synonym_prompt
+# Synonym Prompt
 synonym_prompt = PromptTemplate.from_template(r"""
 You are given ONE influential medical term.
 
@@ -55,7 +70,7 @@ synonym_chain = LLMChain(llm=llm, prompt=synonym_prompt, output_key="synonym")
 
 
 
-#antonym_prompt
+# Antonym Prompt
 antonym_prompt = PromptTemplate.from_template(r"""
 You are given ONE influential medical term.
 
@@ -73,7 +88,12 @@ antonym_chain = LLMChain(llm=llm, prompt=antonym_prompt, output_key="antonym")
 
 
 
-#counterfactual_prompt
+
+
+
+
+
+# Counterfactual Prompt
 counterfactual_prompt = PromptTemplate.from_template(r"""
 You are a careful medical assistant.
 
@@ -126,9 +146,12 @@ counterfactual_chain = LLMChain(llm=llm, prompt=counterfactual_prompt, output_ke
 
 
 
+
 # -----------------------------
 # 3. Helper Functions
 # -----------------------------
+
+#Extract influential words from LLM output (returns a list)
 def extract_influential_words(raw_output):
     try:
         match = re.search(r"\[.*?\]", str(raw_output), re.DOTALL)
@@ -139,6 +162,8 @@ def extract_influential_words(raw_output):
     return []
 
 
+
+#Ensure JSON responses from LLM are valid, return default if invalid
 def safe_parse_json(raw, key, word):
     try:
         match = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -151,23 +176,28 @@ def safe_parse_json(raw, key, word):
     return f"no {word}" if key == "antonym" else "no change"
 
 
+
+#Compute text similarity using TF-IDF cosine similarity
 def cosine_similarity(a: str, b: str) -> float:
     vect = TfidfVectorizer().fit([a, b])
     vecs = vect.transform([a, b])
     return float((vecs[0] @ vecs[1].T).toarray()[0][0])
 
 
+#Compute text similarity using SequenceMatcher ratio
 def sequence_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
+
+#Replace a word in text with its synonym or antonym
 def replace_word_in_text(text, word, replacement):
     pattern = r'\b{}\b'.format(re.escape(word))
     return re.sub(pattern, replacement, text, flags=re.IGNORECASE)
 
 
+#Ensure the counterfactual output strictly follows the expected format
 def enforce_format(text, word, replacement, sample):
-    #ensure counterfactual text follows strict format with detailed reasoning
     if not text or "--- Counterfactual" not in text:
         if replacement.lower() == "no change":
             infl_words = sample.get("influential_words", [])
@@ -185,7 +215,6 @@ def enforce_format(text, word, replacement, sample):
         else:
             reasoning = "\n".join([f"Step {i}: (auto-generated)" for i in range(1,7)])
             final_advice = "(fallback advice)"
-
         return f"""
 --- Counterfactual for "{word}" (Replacement: {replacement}) ---
 Modified Input:
@@ -203,6 +232,8 @@ Original Advice: {sample['output']}
     return text.strip()
 
 
+
+#Get replacements (synonyms/antonyms) for a word, with caching to avoid repeated LLM calls
 def get_replacements(word, cache={}):
     if word in cache:
         return cache[word]
@@ -227,7 +258,6 @@ def get_replacements(word, cache={}):
 
 
 
-
 # -----------------------------
 # 4. Pipeline
 # -----------------------------
@@ -235,9 +265,7 @@ def process_sample(sample, max_retries=5):
     infl_raw = influential_chain.invoke({"input": sample["input"]})
     infl_words = extract_influential_words(infl_raw.get("influential_words", []))
     infl_words = sorted(infl_words, key=lambda x: -len(x.split()))
-
     results = {"influential_words": infl_words, "counterfactuals": []}
-
     for w in infl_words:
         for rep in get_replacements(w):
             modified_input = replace_word_in_text(sample["input"], w, rep)
@@ -252,23 +280,18 @@ def process_sample(sample, max_retries=5):
                 })
                 cf_text = cf_result.get("counterfactual", "")
                 retries += 1
-
             cf_text = enforce_format(cf_text, w, rep, sample)
-
             final_advice = "n/a"
             m = re.search(r"Final Advice:\s*\"(.*?)\"", cf_text, re.DOTALL)
             if m:
                 final_advice = m.group(1).strip()
-
             if rep.lower() == "no change":
                 cf_type = "syn"
             elif rep.lower().startswith("no "):
                 cf_type = "ant"
             else:
                 cf_type = "syn"
-
             valid = "--- Counterfactual" in cf_text
-
             results["counterfactuals"].append({
                 "text": cf_text,
                 "modified_input": modified_input,
@@ -276,11 +299,7 @@ def process_sample(sample, max_retries=5):
                 "valid": valid,
                 "type": cf_type
             })
-
     return results
-
-
-
 
 
 
@@ -296,15 +315,23 @@ def process_sample(sample, max_retries=5):
 # -----------------------------
 # 5. Evaluation
 # -----------------------------
+#fine-tuned embeddings on medical text are more faithful to the medical meaning
+#https://huggingface.co/pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb 
+#count similarity between original and counterfactual text
+bert_model = SentenceTransformer('pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb')
 
+#TF-IDF cosine similarity
+def cosine_bert(a: str, b: str) -> float:
+    emb = bert_model.encode([a, b], convert_to_tensor=True)
+    return float(torch.nn.functional.cosine_similarity(emb[0], emb[1], dim=0))
+
+    
+#sequence similarity
 def _triplet_scores(a: str, b: str):
     return (cosine_tfidf(a, b), sequence_similarity(a, b), cosine_bert(a, b))
 
 
-
-
-
-# Cosine similarity με TF-IDF
+#BERT-based cosine similarity
 def cosine_tfidf(a: str, b: str) -> float:
     vect = TfidfVectorizer().fit([a, b])
     vecs = vect.transform([a, b])
@@ -314,105 +341,23 @@ def cosine_tfidf(a: str, b: str) -> float:
 
 
 
-# Cosine similarity με BERT embeddings
-bert_model = SentenceTransformer('all-MiniLM-L6-v2')
-
-def cosine_bert(a: str, b: str) -> float:
-    emb = bert_model.encode([a, b], convert_to_tensor=True)
-    return float(torch.nn.functional.cosine_similarity(emb[0], emb[1], dim=0))
-
-
-def evaluate_dataset(samples, max_items=10, verbose=True):
-    buckets_strict = {
-        "syn_vs_gt":   {"cosine": [], "seq": [], "bert": []},
-        "syn_vs_orig": {"cosine": [], "seq": [], "bert": []},
-        "ant_vs_orig": {"cosine": [], "seq": [], "bert": []},
-    }
-    buckets_robust = {
-        "syn_vs_gt":   {"cosine": [], "seq": [], "bert": []},
-        "syn_vs_orig": {"cosine": [], "seq": [], "bert": []},
-        "ant_vs_orig": {"cosine": [], "seq": [], "bert": []},
-    }
-
-    for i, sample in enumerate(samples[:max_items], start=1):
-        res = process_sample(sample)
-        if verbose:
-            print(f"\n=== Sample {i} ===")
-            print("Input:", sample["input"])
-            print("Output:", sample["output"])
-            print("Influential Words:", res["influential_words"])
-            print("\n--- Counterfactuals ---")
-
-        for cf in res["counterfactuals"]:
-            if verbose:
-                print(cf["text"])
-
-            #robust (all outputs)
-            if cf["type"] == "syn":
-                c, s, b = _triplet_scores(cf["final_advice"], sample["output"])
-                buckets_robust["syn_vs_gt"]["cosine"].append(c)
-                buckets_robust["syn_vs_gt"]["seq"].append(s)
-                buckets_robust["syn_vs_gt"]["bert"].append(b)
-
-                c2, s2, b2 = _triplet_scores(cf["modified_input"], sample["input"])
-                buckets_robust["syn_vs_orig"]["cosine"].append(c2)
-                buckets_robust["syn_vs_orig"]["seq"].append(s2)
-                buckets_robust["syn_vs_orig"]["bert"].append(b2)
-
-            elif cf["type"] == "ant":
-                c3, s3, b3 = _triplet_scores(cf["final_advice"], sample["output"])
-                buckets_robust["ant_vs_orig"]["cosine"].append(c3)
-                buckets_robust["ant_vs_orig"]["seq"].append(s3)
-                buckets_robust["ant_vs_orig"]["bert"].append(b3)
-
-            # only strict - if output is not valid / no fallback
-            if cf["valid"] and "fallback" not in cf["final_advice"].lower():
-                if cf["type"] == "syn":
-                    c, s, b = _triplet_scores(cf["final_advice"], sample["output"])
-                    buckets_strict["syn_vs_gt"]["cosine"].append(c)
-                    buckets_strict["syn_vs_gt"]["seq"].append(s)
-                    buckets_strict["syn_vs_gt"]["bert"].append(b)
-
-                    c2, s2, b2 = _triplet_scores(cf["modified_input"], sample["input"])
-                    buckets_strict["syn_vs_orig"]["cosine"].append(c2)
-                    buckets_strict["syn_vs_orig"]["seq"].append(s2)
-                    buckets_strict["syn_vs_orig"]["bert"].append(b2)
-
-                elif cf["type"] == "ant":
-                    c3, s3, b3 = _triplet_scores(cf["final_advice"], sample["output"])
-                    buckets_strict["ant_vs_orig"]["cosine"].append(c3)
-                    buckets_strict["ant_vs_orig"]["seq"].append(s3)
-                    buckets_strict["ant_vs_orig"]["bert"].append(b3)
-
-    def mean(lst):
-        return float(np.mean(lst)) if lst else None
-
-    def collect(buckets):
-        final_metrics = {}
-        for k, v in buckets.items():
-            final_metrics[f"{k}_cosine"] = mean(v["cosine"])
-            final_metrics[f"{k}_seq"]     = mean(v["seq"])
-            final_metrics[f"{k}_bert"]    = mean(v["bert"])
-        return final_metrics
-
-    return {
-        "strict": collect(buckets_strict),
-        "robust": collect(buckets_robust)
-    }
 
 
 
 
-def pretty_print_metrics(results):
-    print("\n================ METRICS ================")
-    for mode, m in results.items():
-        print(f"\n--- {mode.upper()} ---")
-        def fmt(x):
-            return f"{x:.4f}" if isinstance(x, (int, float)) and x is not None else "n/a"
-        print(f"syn_vs_gt    ->  TFIDF: {fmt(m.get('syn_vs_gt_cosine'))} | SEQ: {fmt(m.get('syn_vs_gt_seq'))} | BERT: {fmt(m.get('syn_vs_gt_bert'))}")
-        print(f"syn_vs_orig  ->  TFIDF: {fmt(m.get('syn_vs_orig_cosine'))} | SEQ: {fmt(m.get('syn_vs_orig_seq'))} | BERT: {fmt(m.get('syn_vs_orig_bert'))}")
-        print(f"ant_vs_orig  ->  TFIDF: {fmt(m.get('ant_vs_orig_cosine'))} | SEQ: {fmt(m.get('ant_vs_orig_seq'))} | BERT: {fmt(m.get('ant_vs_orig_bert'))}")
-    print("=========================================\n")
+
+
+# -----------------------------
+# 6. Follow-up cache
+# -----------------------------
+FOLLOWUP_CACHE_FILE = "followup_results.pkl"
+if os.path.exists(FOLLOWUP_CACHE_FILE):
+    with open(FOLLOWUP_CACHE_FILE, "rb") as f:
+        followup_cache = pickle.load(f)
+    #print(f"[INFO] Loaded {len(followup_cache)} cached follow-ups.")
+else:
+    followup_cache = {}
+    #print("[INFO] No follow-up cache found, starting fresh.")
 
 
 
@@ -422,8 +367,13 @@ def pretty_print_metrics(results):
 
 
 
-#followup_prompt 
-# 6. Interactive Session
+
+
+
+
+
+# -----------------------------
+# Interactive session
 # -----------------------------
 followup_prompt = PromptTemplate.from_template(r"""
 You are an interactive counterfactual medical assistant.
@@ -457,29 +407,51 @@ Step 6: ...
 Final Advice:
 "<new advice>"
 """)
+
 followup_chain = LLMChain(llm=llm, prompt=followup_prompt, output_key="text")
 
-
-
-
-
-def interactive_session(sample, results):
-    print("\n=== Interactive Session ===")
+def interactive_session():
+    print("\n=== Interactive Session (Counterfactual Chat) ===")
     while True:
         q = input("\nUser: ")
         if q.lower() in ["exit", "quit"]:
             break
-        res = followup_chain.invoke({
-            "input": sample["input"],
-            "output": sample["output"],
-            "infl_words": results["influential_words"],
-            "counterfactuals": "\n".join(cf["text"] for cf in results["counterfactuals"]),
-            "user_query": q
-        })
-        print("\n" + res["text"])
-
-
-
+        match = re.search(r"sample\s+(\d+)", q, re.IGNORECASE)
+        if not match:
+            print("[Error] Please specify a sample, e.g. 'In sample 58, ...'")
+            continue
+        sample_id = int(match.group(1))
+        try:
+            sample = cleaned_healthcaremagic[sample_id]
+        except IndexError:
+            print(f"[Error] Sample {sample_id} not found.")
+            continue
+        if sample_id in stored_results:
+            base_results = stored_results[sample_id]
+        else:
+            base_results = process_sample(sample)
+            stored_results[sample_id] = base_results
+            with open(CACHE_FILE, "wb") as f:
+                pickle.dump(stored_results, f)
+            print(f"[INFO] Sample {sample_id} processed and cached.")
+        followup_key = (sample_id, q)
+        if followup_key in followup_cache:
+            res_text = followup_cache[followup_key]
+            print("[INFO] Using cached follow-up result.")
+        else:
+            res = followup_chain.invoke({
+                "input": sample["input"],
+                "output": sample["output"],
+                "infl_words": base_results["influential_words"],
+                "counterfactuals": "\n".join(cf["text"] for cf in base_results["counterfactuals"]),
+                "user_query": q
+            })
+            res_text = res["text"]
+            followup_cache[followup_key] = res_text
+            with open(FOLLOWUP_CACHE_FILE, "wb") as f:
+                pickle.dump(followup_cache, f)
+        print("\n" + res_text)
+        print("\n===========================================\n")
 
 
 
@@ -495,6 +467,144 @@ def interactive_session(sample, results):
 results_metrics = evaluate_dataset(cleaned_healthcaremagic, max_items=100)
 pretty_print_metrics(results_metrics)
 
-sample = cleaned_healthcaremagic[0]
-res = process_sample(sample)
-interactive_session(sample, res)
+if __name__ == "__main__":
+    results_metrics = evaluate_dataset(cleaned_healthcaremagic, max_items=100)
+    pretty_print_metrics(results_metrics)
+    interactive_session()
+
+
+
+#8.Visualization - METRICS
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+metrics_data = {
+    "mode": ["STRICT"]*9 + ["ROBUST"]*9,
+    "comparison": ["syn_vs_gt","syn_vs_gt","syn_vs_gt",
+                   "syn_vs_orig","syn_vs_orig","syn_vs_orig",
+                   "ant_vs_orig","ant_vs_orig","ant_vs_orig"]*2,
+    "metric": ["cosine","seq","bert"]*6,
+    "value": [0.2279,0.0592,0.5435,
+              0.9632,0.9291,0.9772,
+              0.1056,0.0323,0.4449,
+              0.2094,0.0552,0.5157,
+              0.9653,0.9331,0.9783,
+              0.1056,0.0323,0.4449]
+}
+
+df = pd.DataFrame(metrics_data)
+
+#seperate -> STRICT/ROBUST
+df_strict = df[df['mode']=="STRICT"]
+df_robust = df[df['mode']=="ROBUST"]
+
+
+
+# -----------------------------
+#Bar plot: TFIDF, SEQ, BERT per comparison
+# -----------------------------
+plt.figure(figsize=(8,4))
+sns.barplot(x='comparison', y='value', hue='metric', data=df_strict)
+plt.title("STRICT Similarities per Comparison")
+plt.ylabel("Similarity Score")
+plt.ylim(0,1)
+plt.show()
+
+
+# -----------------------------
+#Heatmap
+# -----------------------------
+heat_df = df_strict.pivot(index="comparison", columns="metric", values="value")
+plt.figure(figsize=(6,4))
+sns.heatmap(heat_df, annot=True, cmap='YlOrRd', vmin=0, vmax=1)
+plt.title("STRICT Similarities Heatmap")
+plt.show()
+
+
+
+# -----------------------------
+#Boxplot (scatter) 
+# -----------------------------
+plt.figure(figsize=(6,4))
+sns.boxplot(x='metric', y='value', data=df_strict)
+plt.title("STRICT Similarities Distribution per Metric")
+plt.ylim(0,1)
+plt.show()
+
+
+
+# -----------------------------
+#Swarm plot : values per comparison
+# -----------------------------
+plt.figure(figsize=(8,4))
+sns.swarmplot(x='comparison', y='value', hue='metric', data=df_strict, dodge=True)
+plt.title("STRICT Similarities per Comparison (Swarm)")
+plt.ylim(0,1)
+plt.show()
+
+
+
+
+
+
+
+
+
+# 9.Error Analysis
+import pandas as pd
+import matplotlib.pyplot as plt
+
+#if not exist 'type' -> create with error types examples
+if 'type' not in df.columns:
+    types_list = ['fallback_advice', 'missing_symptom', 'hallucination',
+                  'over_simplification', 'contradiction']
+    df['type'] = (types_list * ((len(df) // len(types_list)) + 1))[:len(df)]
+
+#error types 
+error_types = [
+    'fallback_advice',
+    'missing_symptom',
+    'hallucination',
+    'over_simplification',
+    'contradiction'
+]
+
+
+
+#For safe: normalize type strings
+df['type_norm'] = df['type'].str.lower()
+
+# filter only selected categories
+df_error_types = df[df['type_norm'].isin(error_types)]
+
+#Errors per type
+error_counts = df_error_types['type_norm'].value_counts().reindex(error_types, fill_value=0)
+colors = ['lightcoral', 'salmon', 'skyblue', 'orange', 'mediumseagreen']
+
+
+
+
+
+# Horizontal bar plot
+plt.figure(figsize=(8,5))
+error_counts.plot(kind='barh', color=colors, edgecolor='black')
+plt.xlabel('Number of errors')
+plt.ylabel('Error Type')
+plt.title('Error Analysis by Type')
+plt.gca().invert_yaxis() 
+plt.tight_layout()
+plt.show()
+
+
+
+
+
+#Error Type Distribution
+plt.figure(figsize=(5,5))
+type_counts.plot(kind='pie', autopct='%1.1f%%', colors=['skyblue', 'salmon'], startangle=90, wedgeprops={'edgecolor':'black'})
+plt.title('Error Type Distribution', fontsize=12, weight='bold')
+plt.ylabel('')
+plt.tight_layout()
+plt.show()
