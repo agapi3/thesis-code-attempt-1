@@ -1,11 +1,15 @@
 from langchain import LLMChain, PromptTemplate
 from langchain_community.llms import Ollama
 import re, ast, os, json, numpy as np
+import pandas as pd
 from difflib import SequenceMatcher
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sentence_transformers import SentenceTransformer
 import torch
 import pickle
+import seaborn as sns
+import matplotlib.pyplot as plt
+
 
 # -----------------------------
 # Cache setup
@@ -14,10 +18,10 @@ CACHE_FILE = "stored_results.pkl"
 if os.path.exists(CACHE_FILE):
     with open(CACHE_FILE, "rb") as f:
         stored_results = pickle.load(f)
-    #print(f"[INFO] Loaded {len(stored_results)} cached results.")
+    
 else:
     stored_results = {}
-    #print("[INFO] No cache found, will compute from scratch.")
+    
 
 
 
@@ -354,10 +358,10 @@ FOLLOWUP_CACHE_FILE = "followup_results.pkl"
 if os.path.exists(FOLLOWUP_CACHE_FILE):
     with open(FOLLOWUP_CACHE_FILE, "rb") as f:
         followup_cache = pickle.load(f)
-    #print(f"[INFO] Loaded {len(followup_cache)} cached follow-ups.")
+   
 else:
     followup_cache = {}
-    #print("[INFO] No follow-up cache found, starting fresh.")
+    
 
 
 
@@ -475,10 +479,6 @@ if __name__ == "__main__":
 
 
 #8.Visualization - METRICS
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 metrics_data = {
     "mode": ["STRICT"]*9 + ["ROBUST"]*9,
@@ -553,8 +553,6 @@ plt.show()
 
 
 # 9.Error Analysis
-import pandas as pd
-import matplotlib.pyplot as plt
 
 #if not exist 'type' -> create with error types examples
 if 'type' not in df.columns:
