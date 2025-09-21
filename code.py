@@ -10,6 +10,18 @@ import pickle
 import seaborn as sns
 import matplotlib.pyplot as plt
 
+from langchain import LLMChain, PromptTemplate
+from langchain_community.llms import Ollama
+import re, ast, os, json, numpy as np
+import pandas as pd
+from difflib import SequenceMatcher
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sentence_transformers import SentenceTransformer
+import torch
+import pickle
+import seaborn as sns
+import matplotlib.pyplot as plt
+
 
 # -----------------------------
 # Cache setup
@@ -342,7 +354,136 @@ def cosine_tfidf(a: str, b: str) -> float:
     return float((vecs[0] @ vecs[1].T).toarray()[0][0])
 
 
+CACHE_FILE = "stored_results.pkl"
 
+if os.path.exists(CACHE_FILE):
+    with open(CACHE_FILE, "rb") as f:
+        stored_results = pickle.load(f)
+    print(f"[INFO] Loaded {len(stored_results)} cached results.")
+else:
+    stored_results = {}
+    print("[INFO] No cache found, will compute from scratch.")
+
+
+
+
+def evaluate_dataset(samples, max_items=10, verbose=True):
+    buckets_strict = {
+        "syn_vs_gt": {"cosine": [], "seq": [], "bert": []},
+        "syn_vs_orig": {"cosine": [], "seq": [], "bert": []},
+        "ant_vs_orig": {"cosine": [], "seq": [], "bert": []},
+    }
+
+    buckets_robust = {
+        "syn_vs_gt": {"cosine": [], "seq": [], "bert": []},
+        "syn_vs_orig": {"cosine": [], "seq": [], "bert": []},
+        "ant_vs_orig": {"cosine": [], "seq": [], "bert": []},
+    }
+
+    for i, sample in enumerate(samples[:max_items]):
+        # -------- cache --------
+        if i in stored_results:
+            res = stored_results[i]
+            if verbose:
+                print(f"[INFO] Sample {i} loaded from cache.")
+        else:
+            res = process_sample(sample)
+            stored_results[i] = res
+            with open(CACHE_FILE, "wb") as f:
+                pickle.dump(stored_results, f)
+            if verbose:
+                print(f"[INFO] Sample {i} processed and cached.")
+
+        if verbose:
+            print(f"\n=== Sample {i} ===")
+            print("Input:", sample["input"])
+            print("Output:", sample["output"])
+            print("Influential Words:", res["influential_words"])
+            print("\n--- Counterfactuals ---")
+            for cf in res["counterfactuals"]:
+                print(cf["text"])
+
+        # -------- Robust (all outputs) --------
+        for cf in res["counterfactuals"]:
+            if cf["type"] == "syn":
+                c, s, b = _triplet_scores(cf["final_advice"], sample["output"])
+                buckets_robust["syn_vs_gt"]["cosine"].append(c)
+                buckets_robust["syn_vs_gt"]["seq"].append(s)
+                buckets_robust["syn_vs_gt"]["bert"].append(b)
+
+                c2, s2, b2 = _triplet_scores(cf["modified_input"], sample["input"])
+                buckets_robust["syn_vs_orig"]["cosine"].append(c2)
+                buckets_robust["syn_vs_orig"]["seq"].append(s2)
+                buckets_robust["syn_vs_orig"]["bert"].append(b2)
+
+            elif cf["type"] == "ant":
+                c3, s3, b3 = _triplet_scores(cf["final_advice"], sample["output"])
+                buckets_robust["ant_vs_orig"]["cosine"].append(c3)
+                buckets_robust["ant_vs_orig"]["seq"].append(s3)
+                buckets_robust["ant_vs_orig"]["bert"].append(b3)
+
+        # -------- Strict (only valid, not fallback) --------
+        for cf in res["counterfactuals"]:
+            if cf["valid"] and "fallback" not in cf["final_advice"].lower():
+                if cf["type"] == "syn":
+                    c, s, b = _triplet_scores(cf["final_advice"], sample["output"])
+                    buckets_strict["syn_vs_gt"]["cosine"].append(c)
+                    buckets_strict["syn_vs_gt"]["seq"].append(s)
+                    buckets_strict["syn_vs_gt"]["bert"].append(b)
+
+                    c2, s2, b2 = _triplet_scores(cf["modified_input"], sample["input"])
+                    buckets_strict["syn_vs_orig"]["cosine"].append(c2)
+                    buckets_strict["syn_vs_orig"]["seq"].append(s2)
+                    buckets_strict["syn_vs_orig"]["bert"].append(b2)
+
+                elif cf["type"] == "ant":
+                    c3, s3, b3 = _triplet_scores(cf["final_advice"], sample["output"])
+                    buckets_strict["ant_vs_orig"]["cosine"].append(c3)
+                    buckets_strict["ant_vs_orig"]["seq"].append(s3)
+                    buckets_strict["ant_vs_orig"]["bert"].append(b3)
+
+    # -------- metrics --------
+    def mean(lst):
+        return float(np.mean(lst)) if lst else None
+
+    def collect(buckets):
+        final_metrics = {}
+        for k, v in buckets.items():
+            final_metrics[f"{k}_cosine"] = mean(v["cosine"])
+            final_metrics[f"{k}_seq"] = mean(v["seq"])
+            final_metrics[f"{k}_bert"] = mean(v["bert"])
+        return final_metrics
+
+    return {
+        "strict": collect(buckets_strict),
+        "robust": collect(buckets_robust),
+    }
+
+
+def pretty_print_metrics(results):
+    print("\n================ METRICS ================")
+    for mode, m in results.items():
+        print(f"\n--- {mode.upper()} ---")
+
+        def fmt(x):
+            return f"{x:.4f}" if isinstance(x, (int, float)) and x is not None else "n/a"
+
+        print(
+            f"syn_vs_gt   -> TFIDF: {fmt(m.get('syn_vs_gt_cosine'))} "
+            f"| SEQ: {fmt(m.get('syn_vs_gt_seq'))} "
+            f"| BERT: {fmt(m.get('syn_vs_gt_bert'))}"
+        )
+        print(
+            f"syn_vs_orig -> TFIDF: {fmt(m.get('syn_vs_orig_cosine'))} "
+            f"| SEQ: {fmt(m.get('syn_vs_orig_seq'))} "
+            f"| BERT: {fmt(m.get('syn_vs_orig_bert'))}"
+        )
+        print(
+            f"ant_vs_orig -> TFIDF: {fmt(m.get('ant_vs_orig_cosine'))} "
+            f"| SEQ: {fmt(m.get('ant_vs_orig_seq'))} "
+            f"| BERT: {fmt(m.get('ant_vs_orig_bert'))}"
+        )
+    print("=========================================\n")
 
 
 
@@ -475,6 +616,8 @@ if __name__ == "__main__":
     results_metrics = evaluate_dataset(cleaned_healthcaremagic, max_items=100)
     pretty_print_metrics(results_metrics)
     interactive_session()
+
+    
 
 
 
