@@ -10,18 +10,6 @@ import pickle
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-from langchain import LLMChain, PromptTemplate
-from langchain_community.llms import Ollama
-import re, ast, os, json, numpy as np
-import pandas as pd
-from difflib import SequenceMatcher
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sentence_transformers import SentenceTransformer
-import torch
-import pickle
-import seaborn as sns
-import matplotlib.pyplot as plt
-
 
 # -----------------------------
 # Cache setup
