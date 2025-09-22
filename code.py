@@ -1,19 +1,117 @@
-from langchain import LLMChain, PromptTemplate
-from langchain_community.llms import Ollama
-import re, ast, os, json, numpy as np
-import pandas as pd
-from difflib import SequenceMatcher
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sentence_transformers import SentenceTransformer
 import torch
-import pickle
-import seaborn as sns
+import json
+import re
+import ast
+import os
+import pandas as pd
+from datasets import load_dataset
+from langchain_ollama import OllamaLLM
+from langchain.llms import Ollama
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
+from sentence_transformers import SentenceTransformer, util
 import matplotlib.pyplot as plt
+import seaborn as sns
 
 
 # -----------------------------
+# 1) Load dataset & save as healthcaremagic_dataset.json
+# -----------------------------
+
+#load dataset
+ds = load_dataset("Malikeh1375/medical-question-answering-datasets", "chatdoctor_healthcaremagic") 
+ds_healthcaremagic = ds["train"]
+
+# JSON
+with open("healthcaremagic_dataset.json", "w", encoding="utf-8") as f:
+    json.dump(ds_healthcaremagic.to_dict(), f, ensure_ascii=False, indent=4)
+#print("saved")
+
+
+# Φόρτωση από JSON
+with open("healthcaremagic_dataset.json", "r", encoding="utf-8") as f:
+    ds_healthcaremagic = json.load(f)
+
+ds_healthcaremagic = ds["train"]
+print(ds_healthcaremagic[:5])
+
+
+
+#check 
+print(len(ds_healthcaremagic))
+print("NaN values per column (before cleaning):")
+print(pd.DataFrame(ds_healthcaremagic).isna().sum())
+print("Total duplicates (before cleaning):", pd.DataFrame(ds_healthcaremagic).duplicated(subset=["instruction","input","output"]).sum())
+
+
+
+# -----------------------------
+#1.1) Data Preprocessing
+# -----------------------------
+
+#Cleaning function
+def clean_text(text):
+    if not text:
+        return ""  #None or empty : returns an empty string
+
+    text = text.strip().lower()  #whitespace removal + lowercase
+    text = re.sub(r'\s+', ' ', text)  #replace multiple spaces with a single space
+    text = re.sub(r'[^\w\s,.!?]', '', text)  #remove special characters except for -> comma, period, exclamation mark and question mark
+
+    return text
+
+
+#Cleaning dataset
+cleaned_healthcaremagic = []
+
+for example in ds_healthcaremagic:
+    instruction = example['instruction'][0] if isinstance(example['instruction'], list) else example['instruction']
+    input_text = example['input']
+    response = example['output']
+
+    cleaned_instruction = clean_text(instruction)
+    cleaned_input = clean_text(input_text)
+    cleaned_response = clean_text(response)
+
+    #skip, if any field is empty after cleaning
+    if not cleaned_instruction or not cleaned_input or not cleaned_response:
+        continue
+
+    cleaned_healthcaremagic.append({
+        "instruction": cleaned_instruction,
+        "input": cleaned_input,
+        "output": cleaned_response
+    })
+
+
+
+#Remove duplicates
+df = pd.DataFrame(cleaned_healthcaremagic)
+df = df.drop_duplicates(subset=["instruction", "input", "output"])
+cleaned_healthcaremagic = df.to_dict(orient="records")
+print(cleaned_healthcaremagic[:5])
+
+
+#Check
+print(len(cleaned_healthcaremagic))
+print("NaN values per column (after cleaning):")
+print(df.isna().sum())
+print("Total duplicates (after cleaning):", df.duplicated(subset=["instruction","input","output"]).sum())
+
+# -----------------------------
+#2)Define model
+#3)Influential Words,CoT, Counterfactual examples and the final advice from model (implementation via langchain ) 
+# -----------------------------
+
+#Compute hash for a sample
+def compute_sample_hash(sample):
+    """Compute a hash for a sample based on instruction, input, output"""
+    combined = f"{sample['instruction']}||{sample['input']}||{sample['output']}"
+    return hashlib.md5(combined.encode('utf-8')).hexdigest()
+
+
+
 # Cache setup
-# -----------------------------
 CACHE_FILE = "stored_results.pkl"
 if os.path.exists(CACHE_FILE):
     with open(CACHE_FILE, "rb") as f:
@@ -23,21 +121,13 @@ else:
     stored_results = {}
     
 
-
-
-
-
-
-# -----------------------------
-# 1. Define LLM
-# -----------------------------
+#2.1 Define LLM
 llm = Ollama(model="llama2", temperature=0)
 
-# -----------------------------
-# 2. Prompts
-# -----------------------------
 
-# Influential Prompt
+#3 Prompts
+
+#3.1 Influential Prompt
 influential_prompt = PromptTemplate.from_template(r"""
 You are a careful medical assistant.
 
@@ -54,7 +144,7 @@ influential_chain = LLMChain(llm=llm, prompt=influential_prompt, output_key="inf
 
 
 
-# Synonym Prompt
+#3.2 Synonym Prompt
 synonym_prompt = PromptTemplate.from_template(r"""
 You are given ONE influential medical term.
 
@@ -74,7 +164,7 @@ synonym_chain = LLMChain(llm=llm, prompt=synonym_prompt, output_key="synonym")
 
 
 
-# Antonym Prompt
+#3.3 Antonym Prompt
 antonym_prompt = PromptTemplate.from_template(r"""
 You are given ONE influential medical term.
 
@@ -97,7 +187,7 @@ antonym_chain = LLMChain(llm=llm, prompt=antonym_prompt, output_key="antonym")
 
 
 
-# Counterfactual Prompt
+#3.4 Counterfactual Prompt
 counterfactual_prompt = PromptTemplate.from_template(r"""
 You are a careful medical assistant.
 
@@ -152,7 +242,7 @@ counterfactual_chain = LLMChain(llm=llm, prompt=counterfactual_prompt, output_ke
 
 
 # -----------------------------
-# 3. Helper Functions
+# 4. Helper Functions
 # -----------------------------
 
 #Extract influential words from LLM output (returns a list)
@@ -263,7 +353,7 @@ def get_replacements(word, cache={}):
 
 
 # -----------------------------
-# 4. Pipeline
+# 5. Pipeline
 # -----------------------------
 def process_sample(sample, max_retries=5):
     infl_raw = influential_chain.invoke({"input": sample["input"]})
@@ -317,7 +407,7 @@ def process_sample(sample, max_retries=5):
 
 
 # -----------------------------
-# 5. Evaluation
+# 6. Evaluation
 # -----------------------------
 #fine-tuned embeddings on medical text are more faithful to the medical meaning
 #https://huggingface.co/pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb 
@@ -369,18 +459,20 @@ def evaluate_dataset(samples, max_items=10, verbose=True):
     }
 
     for i, sample in enumerate(samples[:max_items]):
-        # -------- cache --------
-        if i in stored_results:
-            res = stored_results[i]
+        sample_hash = compute_sample_hash(sample)
+
+        # -------- cache with hash check --------
+        if i in stored_results and stored_results[i].get("hash") == sample_hash:
+            res = stored_results[i]["result"]
             if verbose:
-                print(f"[INFO] Sample {i} loaded from cache.")
+                print(f"[INFO] Sample {i} unchanged, loaded from cache.")
         else:
             res = process_sample(sample)
-            stored_results[i] = res
+            stored_results[i] = {"result": res, "hash": sample_hash}
             with open(CACHE_FILE, "wb") as f:
                 pickle.dump(stored_results, f)
             if verbose:
-                print(f"[INFO] Sample {i} processed and cached.")
+                print(f"[INFO] Sample {i} processed and cache updated.")
 
         if verbose:
             print(f"\n=== Sample {i} ===")
@@ -481,7 +573,7 @@ def pretty_print_metrics(results):
 
 
 # -----------------------------
-# 6. Follow-up cache
+# 7. Follow-up cache
 # -----------------------------
 FOLLOWUP_CACHE_FILE = "followup_results.pkl"
 if os.path.exists(FOLLOWUP_CACHE_FILE):
@@ -506,7 +598,7 @@ else:
 
 
 # -----------------------------
-# Interactive session
+# 8. Interactive session
 # -----------------------------
 followup_prompt = PromptTemplate.from_template(r"""
 You are an interactive counterfactual medical assistant.
@@ -559,14 +651,29 @@ def interactive_session():
         except IndexError:
             print(f"[Error] Sample {sample_id} not found.")
             continue
+
+        # ----- Hash check & cached processing -----
         if sample_id in stored_results:
-            base_results = stored_results[sample_id]
+            sample_hash = compute_sample_hash(sample)
+            cached_hash = stored_results[sample_id].get("hash")
+            if cached_hash == sample_hash:
+                base_results = stored_results[sample_id]["data"]
+                print("[INFO] Using cached results (hash match).")
+            else:
+                base_results = process_sample(sample)
+                stored_results[sample_id] = {"hash": sample_hash, "data": base_results}
+                with open(CACHE_FILE, "wb") as f:
+                    pickle.dump(stored_results, f)
+                print("[INFO] Sample has changed. Reprocessed and cache updated.")
         else:
             base_results = process_sample(sample)
-            stored_results[sample_id] = base_results
+            sample_hash = compute_sample_hash(sample)
+            stored_results[sample_id] = {"hash": sample_hash, "data": base_results}
             with open(CACHE_FILE, "wb") as f:
                 pickle.dump(stored_results, f)
             print(f"[INFO] Sample {sample_id} processed and cached.")
+
+        # ----- Follow-up interactive query -----
         followup_key = (sample_id, q)
         if followup_key in followup_cache:
             res_text = followup_cache[followup_key]
@@ -583,6 +690,7 @@ def interactive_session():
             followup_cache[followup_key] = res_text
             with open(FOLLOWUP_CACHE_FILE, "wb") as f:
                 pickle.dump(followup_cache, f)
+
         print("\n" + res_text)
         print("\n===========================================\n")
 
@@ -595,7 +703,7 @@ def interactive_session():
 
 
 # -----------------------------
-# 7. Example Run
+# 9. Example Run
 # -----------------------------
 results_metrics = evaluate_dataset(cleaned_healthcaremagic, max_items=100)
 pretty_print_metrics(results_metrics)
@@ -608,8 +716,10 @@ if __name__ == "__main__":
     
 
 
+# -----------------------------
+#10.Visualization - METRICS
+# -----------------------------
 
-#8.Visualization - METRICS
 
 metrics_data = {
     "mode": ["STRICT"]*9 + ["ROBUST"]*9,
@@ -633,9 +743,7 @@ df_robust = df[df['mode']=="ROBUST"]
 
 
 
-# -----------------------------
 #Bar plot: TFIDF, SEQ, BERT per comparison
-# -----------------------------
 plt.figure(figsize=(8,4))
 sns.barplot(x='comparison', y='value', hue='metric', data=df_strict)
 plt.title("STRICT Similarities per Comparison")
@@ -644,9 +752,7 @@ plt.ylim(0,1)
 plt.show()
 
 
-# -----------------------------
 #Heatmap
-# -----------------------------
 heat_df = df_strict.pivot(index="comparison", columns="metric", values="value")
 plt.figure(figsize=(6,4))
 sns.heatmap(heat_df, annot=True, cmap='YlOrRd', vmin=0, vmax=1)
@@ -655,9 +761,8 @@ plt.show()
 
 
 
-# -----------------------------
+
 #Boxplot (scatter) 
-# -----------------------------
 plt.figure(figsize=(6,4))
 sns.boxplot(x='metric', y='value', data=df_strict)
 plt.title("STRICT Similarities Distribution per Metric")
@@ -666,9 +771,7 @@ plt.show()
 
 
 
-# -----------------------------
 #Swarm plot : values per comparison
-# -----------------------------
 plt.figure(figsize=(8,4))
 sns.swarmplot(x='comparison', y='value', hue='metric', data=df_strict, dodge=True)
 plt.title("STRICT Similarities per Comparison (Swarm)")
@@ -682,8 +785,10 @@ plt.show()
 
 
 
+# -----------------------------
+#11.Error Analysis
+# -----------------------------
 
-# 9.Error Analysis
 
 #if not exist 'type' -> create with error types examples
 if 'type' not in df.columns:
@@ -737,3 +842,6 @@ plt.title('Error Type Distribution', fontsize=12, weight='bold')
 plt.ylabel('')
 plt.tight_layout()
 plt.show()
+
+
+
