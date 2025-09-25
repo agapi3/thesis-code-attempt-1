@@ -412,48 +412,74 @@ def process_sample(sample, max_retries=5):
 #fine-tuned embeddings on medical text are more faithful to the medical meaning
 #https://huggingface.co/pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb 
 #count similarity between original and counterfactual text
+
 bert_model = SentenceTransformer('pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb')
 
-#TF-IDF cosine similarity
 def cosine_bert(a: str, b: str) -> float:
     emb = bert_model.encode([a, b], convert_to_tensor=True)
     return float(torch.nn.functional.cosine_similarity(emb[0], emb[1], dim=0))
 
-    
-#sequence similarity
 def _triplet_scores(a: str, b: str):
     return (cosine_tfidf(a, b), sequence_similarity(a, b), cosine_bert(a, b))
 
-
-#BERT-based cosine similarity
 def cosine_tfidf(a: str, b: str) -> float:
     vect = TfidfVectorizer().fit([a, b])
     vecs = vect.transform([a, b])
     return float((vecs[0] @ vecs[1].T).toarray()[0][0])
 
 
-CACHE_FILE = "stored_results.pkl"
 
-if os.path.exists(CACHE_FILE):
-    with open(CACHE_FILE, "rb") as f:
-        stored_results = pickle.load(f)
-    print(f"[INFO] Loaded {len(stored_results)} cached results.")
-else:
-    stored_results = {}
-    print("[INFO] No cache found, will compute from scratch.")
+# ROUGE-L
+rouge_scorer_fn = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+def rouge_l(a: str, b: str) -> float:
+    try:
+        score = rouge_scorer_fn.score(a, b)
+        return score['rougeL'].fmeasure
+    except:
+        return 0.0
 
+def meteor(a: str, b: str) -> float:
+    try:
+        return meteor_score([b.split()], a.split())
+    except:
+        return 0.0
+
+
+# Distinct-n
+def distinct_n(texts, n=2):
+    if not texts:
+        return 0.0
+    total_ngrams, unique_ngrams = 0, set()
+    for t in texts:
+        tokens = t.split()
+        ngrams = zip(*[tokens[i:] for i in range(n)])
+        ngrams = list(ngrams)
+        total_ngrams += len(ngrams)
+        unique_ngrams.update(ngrams)
+    return len(unique_ngrams)/total_ngrams if total_ngrams > 0 else 0.0
+
+
+# NLI 
+nli_pipeline = pipeline("text-classification", model="facebook/bart-large-mnli")
+
+def factuality(premise: str, hypothesis: str) -> str:
+    res = nli_pipeline([{"text": premise, "text_pair": hypothesis}], truncation=True)
+    return res[0]["label"]
+
+
+    
 
 
 
 def evaluate_dataset(samples, max_items=10, verbose=True):
     buckets_strict = {
-        "syn_vs_gt": {"cosine": [], "seq": [], "bert": []},
+        "syn_vs_gt": {"cosine": [], "seq": [], "bert": [], "rougeL": [], "meteor": [], "factuality": []},
         "syn_vs_orig": {"cosine": [], "seq": [], "bert": []},
         "ant_vs_orig": {"cosine": [], "seq": [], "bert": []},
     }
 
     buckets_robust = {
-        "syn_vs_gt": {"cosine": [], "seq": [], "bert": []},
+        "syn_vs_gt": {"cosine": [], "seq": [], "bert": [], "rougeL": [], "meteor": [], "factuality": []},
         "syn_vs_orig": {"cosine": [], "seq": [], "bert": []},
         "ant_vs_orig": {"cosine": [], "seq": [], "bert": []},
     }
@@ -491,6 +517,15 @@ def evaluate_dataset(samples, max_items=10, verbose=True):
                 buckets_robust["syn_vs_gt"]["seq"].append(s)
                 buckets_robust["syn_vs_gt"]["bert"].append(b)
 
+                # --- New metrics ---
+                r = rouge_l(cf["final_advice"], sample["output"])
+                m = meteor(cf["final_advice"], sample["output"])
+                f = factuality(sample["output"], cf["final_advice"])
+
+                buckets_robust["syn_vs_gt"]["rougeL"].append(r)
+                buckets_robust["syn_vs_gt"]["meteor"].append(m)
+                buckets_robust["syn_vs_gt"]["factuality"].append(f)
+
                 c2, s2, b2 = _triplet_scores(cf["modified_input"], sample["input"])
                 buckets_robust["syn_vs_orig"]["cosine"].append(c2)
                 buckets_robust["syn_vs_orig"]["seq"].append(s2)
@@ -510,6 +545,15 @@ def evaluate_dataset(samples, max_items=10, verbose=True):
                     buckets_strict["syn_vs_gt"]["cosine"].append(c)
                     buckets_strict["syn_vs_gt"]["seq"].append(s)
                     buckets_strict["syn_vs_gt"]["bert"].append(b)
+
+                    # --- New metrics ---
+                    r = rouge_l(cf["final_advice"], sample["output"])
+                    m = meteor(cf["final_advice"], sample["output"])
+                    f = factuality(sample["output"], cf["final_advice"])
+
+                    buckets_strict["syn_vs_gt"]["rougeL"].append(r)
+                    buckets_strict["syn_vs_gt"]["meteor"].append(m)
+                    buckets_strict["syn_vs_gt"]["factuality"].append(f)
 
                     c2, s2, b2 = _triplet_scores(cf["modified_input"], sample["input"])
                     buckets_strict["syn_vs_orig"]["cosine"].append(c2)
@@ -532,6 +576,17 @@ def evaluate_dataset(samples, max_items=10, verbose=True):
             final_metrics[f"{k}_cosine"] = mean(v["cosine"])
             final_metrics[f"{k}_seq"] = mean(v["seq"])
             final_metrics[f"{k}_bert"] = mean(v["bert"])
+            if "rougeL" in v:
+                final_metrics[f"{k}_rougeL"] = mean(v["rougeL"])
+            if "meteor" in v:
+                final_metrics[f"{k}_meteor"] = mean(v["meteor"])
+            if "factuality" in v:
+                # factuality is categorical -> majority vote (or distribution)
+                vals = v["factuality"]
+                if vals:
+                    final_metrics[f"{k}_factuality"] = max(set(vals), key=vals.count)
+                else:
+                    final_metrics[f"{k}_factuality"] = None
         return final_metrics
 
     return {
@@ -540,18 +595,22 @@ def evaluate_dataset(samples, max_items=10, verbose=True):
     }
 
 
+
 def pretty_print_metrics(results):
     print("\n================ METRICS ================")
     for mode, m in results.items():
         print(f"\n--- {mode.upper()} ---")
 
         def fmt(x):
-            return f"{x:.4f}" if isinstance(x, (int, float)) and x is not None else "n/a"
+            return f"{x:.4f}" if isinstance(x, (int, float)) and x is not None else str(x)
 
         print(
             f"syn_vs_gt   -> TFIDF: {fmt(m.get('syn_vs_gt_cosine'))} "
             f"| SEQ: {fmt(m.get('syn_vs_gt_seq'))} "
-            f"| BERT: {fmt(m.get('syn_vs_gt_bert'))}"
+            f"| BERT: {fmt(m.get('syn_vs_gt_bert'))} "
+            f"| ROUGE-L: {fmt(m.get('syn_vs_gt_rougeL'))} "
+            f"| METEOR: {fmt(m.get('syn_vs_gt_meteor'))} "
+            f"| FACT: {fmt(m.get('syn_vs_gt_factuality'))}"
         )
         print(
             f"syn_vs_orig -> TFIDF: {fmt(m.get('syn_vs_orig_cosine'))} "
@@ -564,7 +623,6 @@ def pretty_print_metrics(results):
             f"| BERT: {fmt(m.get('ant_vs_orig_bert'))}"
         )
     print("=========================================\n")
-
 
 
 
