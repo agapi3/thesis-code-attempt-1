@@ -847,14 +847,13 @@ plt.show()
 #11.Error Analysis
 # -----------------------------
 
-
-#if not exist 'type' -> create with error types examples
-if 'type' not in df.columns:
+#new list - error types - due to 'type' (syn/ant) 
+if 'error_type' not in df.columns:
     types_list = ['fallback_advice', 'missing_symptom', 'hallucination',
                   'over_simplification', 'contradiction']
-    df['type'] = (types_list * ((len(df) // len(types_list)) + 1))[:len(df)]
+    df['error_type'] = (types_list * ((len(df) // len(types_list)) + 1))[:len(df)]
 
-#error types 
+#error categories
 error_types = [
     'fallback_advice',
     'missing_symptom',
@@ -863,43 +862,34 @@ error_types = [
     'contradiction'
 ]
 
+# Normalize
+df['error_type_norm'] = df['error_type'].str.lower()
+
+#filter only error types
+df_error_types = df[df['error_type_norm'].isin(error_types)]
+
+# Counts per error type
+error_counts = df_error_types['error_type_norm'].value_counts().reindex(error_types, fill_value=0)
 
 
-#For safe: normalize type strings
-df['type_norm'] = df['type'].str.lower()
-
-# filter only selected categories
-df_error_types = df[df['type_norm'].isin(error_types)]
-
-#Errors per type
-error_counts = df_error_types['type_norm'].value_counts().reindex(error_types, fill_value=0)
 colors = ['lightcoral', 'salmon', 'skyblue', 'orange', 'mediumseagreen']
 
 
 
-
-
-# Horizontal bar plot
+# Bar plot
 plt.figure(figsize=(8,5))
 error_counts.plot(kind='barh', color=colors, edgecolor='black')
 plt.xlabel('Number of errors')
 plt.ylabel('Error Type')
 plt.title('Error Analysis by Type')
-plt.gca().invert_yaxis() 
+plt.gca().invert_yaxis()
 plt.tight_layout()
 plt.show()
 
 
+df['error_type_norm'].value_counts().reindex(error_types, fill_value=0)
 
 
-
-#Error Type Distribution
-plt.figure(figsize=(5,5))
-type_counts.plot(kind='pie', autopct='%1.1f%%', colors=['skyblue', 'salmon'], startangle=90, wedgeprops={'edgecolor':'black'})
-plt.title('Error Type Distribution', fontsize=12, weight='bold')
-plt.ylabel('')
-plt.tight_layout()
-plt.show()
 
 
 
