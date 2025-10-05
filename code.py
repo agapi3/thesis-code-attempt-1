@@ -829,19 +829,6 @@ plt.show()
 
 
 
-#Swarm plot : values per comparison
-plt.figure(figsize=(8,4))
-sns.swarmplot(x='comparison', y='value', hue='metric', data=df_strict, dodge=True)
-plt.title("STRICT Similarities per Comparison (Swarm)")
-plt.ylim(0,1)
-plt.show()
-
-
-
-
-
-
-
 
 # -----------------------------
 #11.Error Analysis
